@@ -1,0 +1,1461 @@
+<!DOCTYPE html>
+<html lang="en" class="light">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#c99200">
+  <link rel="manifest" href="manifest.json">
+  <link rel="icon" type="image/png" href="icon-192.png">
+  <link rel="apple-touch-icon" href="icon-180.png">
+  <meta name="application-name" content="Pizza Hub">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-title" content="Pizza Hub">
+  <title>Pizza Hub — Loyalty Pass</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,600;12..96,800&family=DM+Sans:wght@400;500;700&family=Playfair+Display:wght@500;600&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="style.css">
+  <!-- Firebase Realtime Database (modular SDK v10 from the official CDN).
+       It loads in the background, so the page starts instantly and keeps working
+       from this device's storage if Firebase cannot be reached. -->
+  <script type="module">
+    const firebaseConfig = {
+      apiKey: "AIzaSyBjVDNApNaPcamG1otjKB_Hn6WRMwIBHsg",
+      authDomain: "pizzahub-loyalty.firebaseapp.com",
+      databaseURL: "https://pizzahub-loyalty-default-rtdb.firebaseio.com",
+      projectId: "pizzahub-loyalty",
+      storageBucket: "pizzahub-loyalty.firebasestorage.app",
+      messagingSenderId: "20202018141",
+      appId: "1:20202018141:web:672418d9cb15d3375e04b4",
+      measurementId: "G-YYR65Z47FK"
+    };
+    const SDK_BASE = 'https://www.gstatic.com/firebasejs/10.12.2/';
+    const CONTENT_PATH = 'pizzahub/content';
+    const USERS_PATH = 'pizzahub/users';
+    const ORDERS_PATH = 'pizzahub/orders';
+
+    let fatal = false;
+    let connectedOnce = false;
+    let offlineTimer = null;
+
+    const bridge = {
+      state: 'connecting',   /* connecting | online | offline | error */
+      error: '',
+      received: false,
+      record: null,
+      authUser: null,
+      _api: null,
+      _app: null,
+      _auth: null,
+      _authMod: null,
+      _authPromise: null,
+      _statusFns: [],
+      _dataFns: [],
+      _readyFns: [],
+      _authFns: [],
+      isReady() { return this._api !== null; },
+      onReady(fn) {
+        if (this._api) { try { fn(); } catch (e) { /* ignore */ } }
+        else this._readyFns.push(fn);
+      },
+      onStatus(fn) {
+        this._statusFns.push(fn);
+        try { fn(this.state, this.error); } catch (e) { /* ignore */ }
+      },
+      onData(fn) {
+        this._dataFns.push(fn);
+        if (this.received) { try { fn(this.record); } catch (e) { /* ignore */ } }
+      },
+      _notReady() {
+        const err = new Error('Firebase is not loaded yet.');
+        err.code = 'NOT_READY';
+        return Promise.reject(err);
+      },
+
+      /* ----- deals and banners ----- */
+      save(record) {
+        if (!this._api) return this._notReady();
+        return this._api.set(this._api.contentRef, JSON.parse(JSON.stringify(record)));
+      },
+      get() {
+        if (!this._api) return this._notReady();
+        return this._api.get(this._api.contentRef).then((snap) => snap.val());
+      },
+
+      /* ----- customers (one record per mobile number) ----- */
+      _userRef(mobile) {
+        if (!/^\d{6,15}$/.test(String(mobile))) throw new Error('Invalid mobile number.');
+        return this._api.ref(this._api.db, USERS_PATH + '/' + mobile);
+      },
+      saveUser(mobile, user) {
+        if (!this._api) return this._notReady();
+        try { return this._api.set(this._userRef(mobile), JSON.parse(JSON.stringify(user))); }
+        catch (e) { return Promise.reject(e); }
+      },
+      removeUser(mobile) {
+        if (!this._api) return this._notReady();
+        try { return this._api.set(this._userRef(mobile), null); }
+        catch (e) { return Promise.reject(e); }
+      },
+      getUser(mobile) {
+        if (!this._api) return this._notReady();
+        try { return this._api.get(this._userRef(mobile)).then((snap) => snap.val()); }
+        catch (e) { return Promise.reject(e); }
+      },
+      /* live listener for ONE customer; returns an unsubscribe function */
+      watchUser(mobile, onData, onError) {
+        if (!this._api) return null;
+        try {
+          return this._api.onValue(this._userRef(mobile), (snap) => onData(snap.val()), (err) => { if (onError) onError(err); });
+        } catch (e) { if (onError) onError(e); return null; }
+      },
+      /* live listener for ALL customers (admin); returns an unsubscribe function */
+      watchUsers(onData, onError) {
+        if (!this._api) return null;
+        return this._api.onValue(this._api.ref(this._api.db, USERS_PATH), (snap) => onData(snap.val()), (err) => { if (onError) onError(err); });
+      },
+
+      /* ----- order requests (every tap on "Order on WhatsApp"), one record per order ----- */
+      _orderRef(id) {
+        if (!/^[A-Za-z0-9_-]{4,40}$/.test(String(id))) throw new Error('Invalid order id.');
+        return this._api.ref(this._api.db, ORDERS_PATH + '/' + id);
+      },
+      addOrder(order) {
+        if (!this._api) return this._notReady();
+        try { return this._api.set(this._orderRef(order && order.id), JSON.parse(JSON.stringify(order))); }
+        catch (e) { return Promise.reject(e); }
+      },
+      removeOrder(id) {
+        if (!this._api) return this._notReady();
+        try { return this._api.set(this._orderRef(id), null); }
+        catch (e) { return Promise.reject(e); }
+      },
+      /* live listener for ALL orders (admin); returns an unsubscribe function */
+      watchOrders(onData, onError) {
+        if (!this._api) return null;
+        return this._api.onValue(this._api.ref(this._api.db, ORDERS_PATH), (snap) => onData(snap.val()), (err) => { if (onError) onError(err); });
+      },
+
+      /* ----- optional admin sign-in (Firebase Authentication, email + password) ----- */
+      enableAuth() {
+        if (!this._app) return this._notReady();
+        if (!this._authPromise) {
+          this._authPromise = import(SDK_BASE + 'firebase-auth.js').then((mod) => {
+            this._authMod = mod;
+            this._auth = mod.getAuth(this._app);
+            mod.onAuthStateChanged(this._auth, (user) => {
+              this.authUser = user ? { email: user.email || '', uid: user.uid } : null;
+              this._authFns.forEach((fn) => { try { fn(this.authUser); } catch (e) { /* ignore */ } });
+            });
+          }).catch((e) => { this._authPromise = null; throw e; });
+        }
+        return this._authPromise;
+      },
+      onAuth(fn) {
+        this._authFns.push(fn);
+        try { fn(this.authUser); } catch (e) { /* ignore */ }
+      },
+      signIn(email, password) {
+        return this.enableAuth().then(() => this._authMod.signInWithEmailAndPassword(this._auth, email, password));
+      },
+      signOut() {
+        if (!this._auth) return Promise.resolve();
+        return this._authMod.signOut(this._auth);
+      },
+
+      describeError(e) {
+        const text = ((e && e.code) ? e.code + ' ' : '') + ((e && e.message) ? e.message : '');
+        if (/permission[_ ]denied/i.test(text)) return 'Firebase refused access (permission denied). Check your Realtime Database rules in the Cloud Sync tab, sign in if needed, then reload this page.';
+        if (e && e.code === 'NOT_READY') return 'Firebase is still loading.';
+        if (/offline|network|unavailable|disconnect/i.test(text)) return 'There is no connection to Firebase right now.';
+        return 'Firebase reported a problem: ' + (e && e.message ? e.message : 'unknown error');
+      }
+    };
+    window.PizzaHubCloud = bridge;
+
+    function setState(state, error) {
+      error = error || '';
+      if (bridge.state === state && bridge.error === error) return;
+      bridge.state = state;
+      bridge.error = error;
+      bridge._statusFns.forEach((fn) => { try { fn(state, error); } catch (e) { /* ignore */ } });
+    }
+
+    async function boot() {
+      const watchdog = setTimeout(() => {
+        if (!bridge._api) setState('error', 'Could not load Firebase from the internet. The app is working from this device\'s storage.');
+      }, 15000);
+      try {
+        const [appMod, dbMod] = await Promise.all([
+          import(SDK_BASE + 'firebase-app.js'),
+          import(SDK_BASE + 'firebase-database.js')
+        ]);
+        clearTimeout(watchdog);
+        const app = appMod.initializeApp(firebaseConfig);
+        const db = dbMod.getDatabase(app);
+        const contentRef = dbMod.ref(db, CONTENT_PATH);
+        bridge._app = app;
+        bridge._api = { set: dbMod.set, get: dbMod.get, ref: dbMod.ref, onValue: dbMod.onValue, db: db, contentRef: contentRef };
+        setState('connecting', '');
+        bridge._readyFns.splice(0).forEach((fn) => { try { fn(); } catch (e) { /* ignore */ } });
+
+        /* connection state */
+        dbMod.onValue(dbMod.ref(db, '.info/connected'), (snap) => {
+          if (snap.val() === true) {
+            connectedOnce = true;
+            clearTimeout(offlineTimer);
+            if (!fatal) setState('online', '');
+          } else if (connectedOnce) {
+            if (!fatal) setState('offline', 'You are offline. Changes stay saved on this device and upload when the connection returns.');
+          } else {
+            clearTimeout(offlineTimer);
+            offlineTimer = setTimeout(() => {
+              if (!connectedOnce && !fatal) setState('offline', 'Waiting for a connection to Firebase…');
+            }, 6000);
+          }
+        });
+
+        /* live deals and banners: fires once with the current data, then on every change from any device */
+        dbMod.onValue(contentRef, (snap) => {
+          bridge.record = snap.val();
+          bridge.received = true;
+          bridge._dataFns.forEach((fn) => { try { fn(bridge.record); } catch (e) { /* ignore */ } });
+        }, (err) => {
+          fatal = true;
+          setState('error', bridge.describeError(err));
+        });
+      } catch (e) {
+        clearTimeout(watchdog);
+        setState('error', 'Could not load Firebase from the internet. The app is working from this device\'s storage.');
+      }
+    }
+    boot();
+  </script>
+</head>
+<body class="light">
+
+  <!-- ================= HEADER ================= -->
+  <header class="site-header">
+    <div class="header-inner">
+      <a class="brand" href="#top" aria-label="Pizza Hub home">
+        <div class="logo" aria-hidden="true">🍕</div>
+        <div class="brand-name">Pizza <span>Hub</span></div>
+      </a>
+
+      <div class="menu-wrap">
+        <button class="icon-btn" id="menuBtn" type="button" aria-label="Open menu" aria-haspopup="true" aria-expanded="false">
+          <span class="dots" aria-hidden="true"><i></i><i></i><i></i></span>
+        </button>
+        <div class="dropdown hidden" id="menuDrop" role="menu">
+          <button type="button" role="menuitem" id="menuProfile"><span class="mi">👤</span> Profile details</button>
+          <button type="button" role="menuitem" id="menuDeals"><span class="mi">🔥</span> Explore Deals</button>
+          <button type="button" role="menuitem" id="menuWhatsApp"><span class="mi">💬</span> Order on WhatsApp</button>
+          <button type="button" role="menuitem" id="menuInstall" class="hidden"><span class="mi">📲</span> Install app</button>
+          <button type="button" role="menuitem" id="menuAdmin"><span class="mi">🔐</span> Admin Panel</button>
+        </div>
+      </div>
+    </div>
+  </header>
+
+  <main id="top">
+    <!-- ================= HERO ================= -->
+    <section class="hero wrap">
+      <h1>Taste the magic in every bite—once you try, you'll be hooked for life!</h1>
+      <p>Collect 1 stamp per order. Complete 7 stamps to claim your free burger!</p>
+      <div class="hero-badges" aria-hidden="true">
+        <span class="float-badge">🍕 Fresh Dough Daily</span>
+        <span class="float-badge">🔥 Stone-Baked</span>
+        <span class="float-badge">🍔 Free Burger Reward</span>
+      </div>
+      <div class="install-row hidden" id="installRow" style="margin-top:22px">
+        <button class="btn btn-gold btn-lg" id="installBtn" type="button">📲 Add to Home Screen</button>
+        <p style="margin-top:10px;font-size:0.9rem;color:var(--muted)">Install Pizza Hub as an app for one-tap access to your loyalty card.</p>
+      </div>
+    </section>
+
+    <!-- ================= BANNERS ================= -->
+    <section class="banner-section wrap hidden" id="bannerSection" aria-label="Promotions">
+      <div class="banner-slider" id="bannerSlider"></div>
+    </section>
+
+    <!-- ================= LOYALTY CARD ================= -->
+    <section class="section wrap" id="cardSection">
+      <h2 class="section-title">Your Loyalty Card</h2>
+      <p class="section-sub">Collect 7 stamps and your next burger is on us.</p>
+
+      <div class="glass loyalty" id="loyaltyCard">
+        <div class="loyalty-top">
+          <div>
+            <div class="member-name" id="memberName">Guest</div>
+            <div class="member-meta" id="memberMeta">Log in to see your card</div>
+          </div>
+          <div class="points-pill" id="pointsPill">0 / 7</div>
+        </div>
+
+        <div class="stamps" id="stamps" role="img" aria-label="Loyalty stamps"></div>
+
+        <div class="progress" role="progressbar" aria-valuemin="0" aria-valuemax="7" aria-valuenow="0" id="progressWrap">
+          <div class="progress-bar" id="progressBar"></div>
+        </div>
+        <p class="progress-text" id="progressText">7 stamps to go for a free burger.</p>
+
+        <div class="claim-row hidden" id="claimRow">
+          <button class="btn btn-gold btn-block btn-lg" id="claimBtn" type="button">🎉 Claim your free burger</button>
+        </div>
+      </div>
+
+      <!-- Staff stamp entry -->
+      <div class="glass unlock">
+        <h3>Staff stamp entry</h3>
+        <p>Shop staff enter the secret password to add one stamp to this card.</p>
+        <form class="unlock-row" id="unlockForm" autocomplete="off">
+          <label class="sr-only" for="unlockInput">Admin secret password</label>
+          <input type="password" id="unlockInput" placeholder="Secret password" inputmode="numeric" autocomplete="off">
+          <button class="btn btn-gold" type="submit">Add stamp</button>
+        </form>
+      </div>
+
+      <div class="explore-wrap">
+        <button class="btn btn-red btn-lg" id="exploreBtn" type="button">🔥 Explore Deals</button>
+      </div>
+    </section>
+
+    <!-- ================= DEALS ================= -->
+    <section class="section wrap" id="deals">
+      <h2 class="section-title">Hot Deals</h2>
+      <p class="section-sub">Fresh from the oven. Tap to order on WhatsApp.</p>
+      <div class="deals-grid" id="dealsGrid"></div>
+    </section>
+
+    <!-- ================= REVIEWS ================= -->
+    <section class="section" id="reviews">
+      <div class="wrap">
+        <h2 class="section-title">What Our Customers Say</h2>
+        <p class="section-sub">Real love from our Pizza Hub family.</p>
+      </div>
+      <div class="marquee" aria-label="Customer reviews">
+        <div class="marquee-track" id="reviewTrack"></div>
+      </div>
+    </section>
+  </main>
+
+  <!-- ================= FOOTER ================= -->
+  <footer class="site-footer">
+    <div class="wrap">
+      <div class="footer-box">
+        <div>
+          <h3>About Pizza Hub</h3>
+          <p class="footer-desc" id="footDesc"></p>
+          <div class="staff-block">
+            <h4>Meet our team</h4>
+            <ul id="footStaff"></ul>
+          </div>
+        </div>
+        <div>
+          <h3>Visit &amp; contact</h3>
+          <ul class="contact-list" id="footContact"></ul>
+        </div>
+      </div>
+
+      <div class="socials">
+        <a class="social" id="socTikTok" href="#" target="_blank" rel="noopener noreferrer" aria-label="TikTok">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M16.6 5.8A4.3 4.3 0 0 1 15.5 3h-3.1v12.4a2.6 2.6 0 1 1-2.6-2.6c.27 0 .53.04.77.12V9.7a5.7 5.7 0 1 0 4.93 5.65V9.1a7.4 7.4 0 0 0 4.3 1.38V7.4a4.3 4.3 0 0 1-3.2-1.6z"/></svg>
+        </a>
+        <a class="social" id="socFacebook" href="#" target="_blank" rel="noopener noreferrer" aria-label="Facebook">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M22 12a10 10 0 1 0-11.56 9.88v-6.99H7.9V12h2.54V9.8c0-2.5 1.49-3.89 3.78-3.89 1.09 0 2.24.2 2.24.2v2.46h-1.26c-1.24 0-1.63.77-1.63 1.56V12h2.78l-.44 2.89h-2.34v6.99A10 10 0 0 0 22 12z"/></svg>
+        </a>
+        <a class="social" id="socInstagram" href="#" target="_blank" rel="noopener noreferrer" aria-label="Instagram">
+          <svg viewBox="0 0 24 24" aria-hidden="true" style="fill:none;stroke:#fff;stroke-width:2"><rect x="3" y="3" width="18" height="18" rx="5"/><circle cx="12" cy="12" r="4"/><circle cx="17.3" cy="6.7" r="1" style="fill:#fff;stroke:none"/></svg>
+        </a>
+        <button class="help-link" id="helpLink" type="button">Help Center</button>
+      </div>
+
+      <p class="copyright">© <span id="year"></span> Pizza Hub. Made with love and extra cheese.</p>
+    </div>
+  </footer>
+
+  <!-- ================= MODALS ================= -->
+
+  <!-- Login / signup (cannot be dismissed) -->
+  <div class="modal-backdrop hidden" id="loginModal" role="dialog" aria-modal="true" aria-labelledby="loginTitle" data-locked="true">
+    <div class="glass modal">
+      <h2 id="loginTitle">Welcome to Pizza Hub 🍕</h2>
+      <p class="lead">Enter your name and mobile number. Already a member? Use the same number to open your existing card.</p>
+      <form id="loginForm" novalidate>
+        <div class="field">
+          <label for="loginName">Your name</label>
+          <input type="text" id="loginName" placeholder="e.g. Ali Raza" maxlength="40" autocomplete="name">
+        </div>
+        <div class="field">
+          <label for="loginMobile">Mobile number</label>
+          <input type="tel" id="loginMobile" placeholder="03XX XXXXXXX" inputmode="numeric" maxlength="16" autocomplete="tel">
+          <span class="field-hint">Pakistani mobile number, e.g. 0300 1234567</span>
+        </div>
+        <div class="field-error" id="loginError" role="alert"></div>
+        <button class="btn btn-gold btn-block btn-lg" type="submit">Open my card</button>
+      </form>
+    </div>
+  </div>
+
+  <!-- Profile -->
+  <div class="modal-backdrop hidden" id="profileModal" role="dialog" aria-modal="true" aria-labelledby="profileTitle">
+    <div class="glass modal">
+      <button class="modal-close" type="button" data-close="profileModal" aria-label="Close">✕</button>
+      <h2 id="profileTitle">Profile details</h2>
+      <p class="lead">Your Pizza Hub account.</p>
+      <div>
+        <div class="profile-row"><span>Name</span><span id="pfName">—</span></div>
+        <div class="profile-row"><span>Mobile</span><span id="pfMobile">—</span></div>
+        <div class="profile-row"><span>Stamps</span><span id="pfPoints">—</span></div>
+        <div class="profile-row"><span>Free burgers claimed</span><span id="pfRedeemed">—</span></div>
+      </div>
+      <div class="modal-actions" style="margin-top:20px">
+        <button class="btn btn-ghost" type="button" id="logoutBtn">Log out</button>
+        <button class="btn btn-gold" type="button" data-close="profileModal">Done</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Admin gate -->
+  <div class="modal-backdrop hidden" id="adminGateModal" role="dialog" aria-modal="true" aria-labelledby="gateTitle">
+    <div class="glass modal">
+      <button class="modal-close" type="button" data-close="adminGateModal" aria-label="Close">✕</button>
+      <h2 id="gateTitle">Admin Panel 🔐</h2>
+      <p class="lead">Enter the admin password to continue.</p>
+      <form id="gateForm" autocomplete="off">
+        <div class="field">
+          <label for="gateInput">Password</label>
+          <input type="password" id="gateInput" placeholder="Admin password" autocomplete="off">
+        </div>
+        <div class="field-error" id="gateError" role="alert"></div>
+        <button class="btn btn-gold btn-block" type="submit">Open Admin Panel</button>
+      </form>
+    </div>
+  </div>
+
+  <!-- Reward celebration -->
+  <div class="modal-backdrop hidden" id="rewardModal" role="dialog" aria-modal="true" aria-labelledby="rewardTitle">
+    <div class="glass modal celebrate">
+      <div class="glow-ring" aria-hidden="true"></div>
+      <div class="trophy" aria-hidden="true">🍔</div>
+      <h2 id="rewardTitle">Congratulations! Enjoy your free Burger 🎉</h2>
+      <p class="lead">You collected all 7 stamps. Show this screen to our staff to claim your reward.</p>
+      <div class="modal-actions">
+        <button class="btn btn-ghost" type="button" data-close="rewardModal">Later</button>
+        <button class="btn btn-gold" type="button" id="rewardClaimBtn">Claim reward</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Install help (iPhone Safari has no install button, so we show the steps) -->
+  <div class="modal-backdrop hidden" id="installModal" role="dialog" aria-modal="true" aria-labelledby="installTitle">
+    <div class="glass modal">
+      <button class="modal-close" type="button" data-close="installModal" aria-label="Close">✕</button>
+      <h2 id="installTitle">Install Pizza Hub 📲</h2>
+      <p class="lead">Add the app to your home screen in two taps:</p>
+      <ol style="padding-left:20px;display:grid;gap:12px;margin:0 0 18px">
+        <li><strong>iPhone (Safari):</strong> tap the <strong>Share</strong> button (the square with an arrow), then <strong>Add to Home Screen</strong>, then <strong>Add</strong>.</li>
+        <li><strong>Android (Chrome):</strong> tap the <strong>⋮ menu</strong>, then <strong>Install app</strong> or <strong>Add to Home screen</strong>.</li>
+      </ol>
+      <button class="btn btn-gold btn-block" type="button" data-close="installModal">Got it</button>
+    </div>
+  </div>
+
+  <div class="toast-host" id="toastHost" aria-live="polite"></div>
+
+  <!-- ================= INSTALL AS APP (PWA) ================= -->
+  <script>
+  (function () {
+    'use strict';
+    var deferred = null;                                   /* the browser's install prompt, when it offers one */
+    var installed = false;                                 /* true once the customer has installed the app */
+    var row = document.getElementById('installRow');       /* big button under the headline */
+    var btn = document.getElementById('installBtn');
+    var item = document.getElementById('menuInstall');     /* entry in the 3-dot menu */
+    var ua = navigator.userAgent || '';
+    var mobile = /android|iphone|ipad|ipod/i.test(ua);
+
+    function standalone() {
+      return (window.matchMedia && window.matchMedia('(display-mode: standalone)').matches) || window.navigator.standalone === true;
+    }
+    function refresh() {
+      var show = !installed && !standalone() && (!!deferred || mobile);
+      if (row) row.classList.toggle('hidden', !show);
+      if (item) item.classList.toggle('hidden', !show);
+    }
+    function install() {
+      var drop = document.getElementById('menuDrop');
+      if (drop) drop.classList.add('hidden');
+      if (deferred) {
+        var d = deferred;
+        d.prompt();
+        d.userChoice.then(function (choice) {
+          if (choice && choice.outcome === 'accepted') installed = true;
+          deferred = null;
+          refresh();
+        }, function () { deferred = null; refresh(); });
+      } else {
+        var m = document.getElementById('installModal'); /* iPhone and browsers without an install prompt */
+        if (m) m.classList.remove('hidden');
+      }
+    }
+
+    window.addEventListener('beforeinstallprompt', function (e) { e.preventDefault(); deferred = e; refresh(); });
+    window.addEventListener('appinstalled', function () { installed = true; deferred = null; refresh(); });
+    if (btn) btn.addEventListener('click', install);
+    if (item) item.addEventListener('click', install);
+    refresh();
+
+    /* service worker: needs https (or localhost) */
+    if ('serviceWorker' in navigator && /^https?:$/.test(window.location.protocol)) {
+      window.addEventListener('load', function () {
+        navigator.serviceWorker.register('sw.js').catch(function () { /* ignore */ });
+      });
+    }
+  })();
+  </script>
+
+  <!-- ================= SCRIPT ================= -->
+  <script>
+  (function () {
+    'use strict';
+
+    /* ---------- Storage layer (shared shape with admin.html) ---------- */
+    var KEYS = {
+      users: 'ph_users',
+      session: 'ph_session',
+      settings: 'ph_settings',
+      deals: 'ph_deals',
+      banners: 'ph_banners',
+      stats: 'ph_stats',
+      cloud: 'ph_cloud'
+    };
+    var STAMPS_NEEDED = 7;
+
+    var DEFAULT_SETTINGS = {
+      adminPassword: '6907',
+      whatsapp: '03001234567',
+      footer: {
+        description: 'Step into Pizza Hub, where golden, wood-fired crusts meet slow-simmered sauces and generous, molten cheese. Our warm, softly lit interior with plush seating and a lively open kitchen makes every visit feel like a small celebration, whether you are here for a quick bite or a long family evening.',
+        staff: 'Chef Bilal - Head Pizza Chef\nSana Malik - Front of House\nUsman Tariq - Kitchen Lead',
+        phone: '03001234567',
+        email: 'hello@pizzahub.pk',
+        address: 'Karianwala Main Chowk, Shop No. 4'
+      },
+      social: {
+        tiktok: 'https://www.tiktok.com/',
+        facebook: 'https://www.facebook.com/',
+        instagram: 'https://www.instagram.com/'
+      }
+    };
+
+
+    var REVIEWS = [
+      { name: 'Ayesha Khan', city: 'Lahore', text: 'The crust is unbelievably crisp and the cheese pull is unreal. Best pizza in town!' },
+      { name: 'Muhammad Hamza', city: 'Gujranwala', text: 'Ordered the family feast for a birthday. Everyone was asking where it came from.' },
+      { name: 'Fatima Noor', city: 'Sialkot', text: 'Loved the loyalty card idea. Got my free burger and it was juicy and huge.' },
+      { name: 'Ahmed Raza', city: 'Karianwala', text: 'Fast service, hot food and the staff is very polite. Will come again and again.' },
+      { name: 'Zainab Iqbal', city: 'Jhelum', text: 'The sauce is so flavourful. My kids demand Pizza Hub every weekend now.' },
+      { name: 'Bilal Chaudhry', city: 'Gujrat', text: 'Zinger burger deal is a steal. Great taste and great price.' },
+      { name: 'Hina Siddiqui', city: 'Islamabad', text: 'Cozy interior and very clean. The garlic bread is dangerously good.' },
+      { name: 'Usman Ghani', city: 'Rawalpindi', text: 'Tried the fajita pizza on a friend\'s suggestion. Now I am the one recommending it!' },
+      { name: 'Maryam Tariq', city: 'Faisalabad', text: 'Fresh toppings, perfectly baked. You can really taste the difference.' },
+      { name: 'Hassan Butt', city: 'Lahore', text: 'Ordered on WhatsApp and it was so easy. Delivery was quicker than I expected.' },
+      { name: 'Sadia Malik', city: 'Mandi Bahauddin', text: 'Best cheesy pizza I have had in years. Five stars, no doubt.' },
+      { name: 'Talha Mehmood', city: 'Wazirabad', text: 'Great place to hang out with friends. The stamp card makes it even sweeter.' }
+    ];
+
+    function readJSON(key, fallback) {
+      try {
+        var raw = window.localStorage.getItem(key);
+        if (raw === null || raw === undefined) return fallback;
+        var parsed = JSON.parse(raw);
+        return parsed === null ? fallback : parsed;
+      } catch (e) {
+        return fallback;
+      }
+    }
+    function writeJSON(key, value) {
+      try {
+        window.localStorage.setItem(key, JSON.stringify(value));
+        return true;
+      } catch (e) {
+        return false;
+      }
+    }
+    function getUsers() {
+      var u = readJSON(KEYS.users, {});
+      return (u && typeof u === 'object' && !Array.isArray(u)) ? u : {};
+    }
+    function getSettings() {
+      var s = readJSON(KEYS.settings, {});
+      s = (s && typeof s === 'object') ? s : {};
+      return {
+        adminPassword: typeof s.adminPassword === 'string' && s.adminPassword ? s.adminPassword : DEFAULT_SETTINGS.adminPassword,
+        whatsapp: typeof s.whatsapp === 'string' && s.whatsapp ? s.whatsapp : DEFAULT_SETTINGS.whatsapp,
+        footer: Object.assign({}, DEFAULT_SETTINGS.footer, s.footer || {}),
+        social: Object.assign({}, DEFAULT_SETTINGS.social, s.social || {})
+      };
+    }
+    function getDeals() {
+      var d = readJSON(KEYS.deals, null);
+      return Array.isArray(d) ? d : [];
+    }
+    function getBanners() {
+      var b = readJSON(KEYS.banners, []);
+      return Array.isArray(b) ? b : [];
+    }
+    function getStats() {
+      var s = readJSON(KEYS.stats, {});
+      return { redemptions: (s && Number(s.redemptions)) || 0 };
+    }
+    function getSession() {
+      try { return window.localStorage.getItem(KEYS.session) || ''; } catch (e) { return ''; }
+    }
+    function setSession(mobile) {
+      try {
+        if (mobile) window.localStorage.setItem(KEYS.session, mobile);
+        else window.localStorage.removeItem(KEYS.session);
+      } catch (e) { /* ignore */ }
+    }
+    function currentUser() {
+      var m = getSession();
+      if (!m) return null;
+      var u = getUsers()[m];
+      return u && typeof u === 'object' ? u : null;
+    }
+
+    /* ---------- Helpers ---------- */
+    function $(id) { return document.getElementById(id); }
+    function make(tag, cls, text) {
+      var n = document.createElement(tag);
+      if (cls) n.className = cls;
+      if (text !== undefined && text !== null) n.textContent = text;
+      return n;
+    }
+    function clear(node) { if (node) { while (node.firstChild) node.removeChild(node.firstChild); } }
+    function safeUrl(u) { return (typeof u === 'string' && /^https?:\/\//i.test(u.trim())) ? u.trim() : '#'; }
+    function safeImage(u) {
+      if (typeof u !== 'string') return '';
+      if (/^data:image\/(png|jpe?g|webp|gif);base64,/i.test(u)) {
+        return (u.indexOf('"') < 0 && u.indexOf("'") < 0 && u.indexOf(')') < 0) ? u : '';
+      }
+      return (u.length <= 600 && /^https:\/\/[^\s"'()<>\\]+$/i.test(u)) ? u : '';
+    }
+
+    function normalizeMobile(input) {
+      var d = String(input || '').replace(/\D/g, '');
+      if (d.indexOf('0092') === 0) d = '0' + d.slice(4);
+      else if (d.indexOf('92') === 0 && d.length === 12) d = '0' + d.slice(2);
+      else if (d.length === 10 && d.charAt(0) === '3') d = '0' + d;
+      return /^03\d{9}$/.test(d) ? d : '';
+    }
+    function whatsappNumber(raw) {
+      var d = String(raw || '').replace(/\D/g, '');
+      if (d.indexOf('0092') === 0) d = d.slice(2);
+      if (d.charAt(0) === '0') d = '92' + d.slice(1);
+      return d;
+    }
+    function whatsappLink(text) {
+      var num = whatsappNumber(getSettings().whatsapp);
+      return 'https://wa.me/' + num + '?text=' + encodeURIComponent(text);
+    }
+    function formatDate(iso) {
+      try {
+        var d = new Date(iso);
+        if (isNaN(d.getTime())) return '';
+        return d.toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' });
+      } catch (e) { return ''; }
+    }
+
+    function toast(message, type) {
+      var host = $('toastHost');
+      if (!host) return;
+      var t = make('div', 'toast' + (type ? ' ' + type : ''), message);
+      host.appendChild(t);
+      setTimeout(function () { if (t.parentNode) t.parentNode.removeChild(t); }, 3200);
+    }
+
+    /* ---------- Modals ---------- */
+    function openModal(id) {
+      var m = $(id);
+      if (!m) return;
+      m.classList.remove('hidden');
+      var first = m.querySelector('input, button.btn');
+      if (first) setTimeout(function () { try { first.focus(); } catch (e) {} }, 60);
+    }
+    function closeModal(id) {
+      var m = $(id);
+      if (m) m.classList.add('hidden');
+    }
+    function closeAllDismissible() {
+      var list = document.querySelectorAll('.modal-backdrop');
+      for (var i = 0; i < list.length; i++) {
+        if (list[i].getAttribute('data-locked') !== 'true') list[i].classList.add('hidden');
+      }
+    }
+
+    /* ---------- Menu ---------- */
+    function setMenu(open) {
+      var drop = $('menuDrop'), btn = $('menuBtn');
+      if (!drop || !btn) return;
+      drop.classList.toggle('hidden', !open);
+      btn.setAttribute('aria-expanded', open ? 'true' : 'false');
+    }
+
+    /* ---------- Rendering ---------- */
+    function renderCard() {
+      var user = currentUser();
+      var pts = user ? Math.max(0, Math.min(STAMPS_NEEDED, Number(user.points) || 0)) : 0;
+
+      var nameEl = $('memberName'), metaEl = $('memberMeta'), pill = $('pointsPill');
+      if (nameEl) nameEl.textContent = user ? user.name : 'Guest';
+      if (metaEl) {
+        var since = user ? formatDate(user.createdAt) : '';
+        metaEl.textContent = user ? ('Mobile ' + user.mobile + (since ? ' · Member since ' + since : '')) : 'Log in to see your card';
+      }
+      if (pill) pill.textContent = pts + ' / ' + STAMPS_NEEDED;
+
+      var stamps = $('stamps');
+      if (stamps) {
+        clear(stamps);
+        for (var i = 1; i <= STAMPS_NEEDED; i++) {
+          var isFinal = i === STAMPS_NEEDED;
+          var filled = i <= pts;
+          var cls = 'stamp' + (filled ? ' filled' : '') + (isFinal ? ' final' : '');
+          var label = filled ? (isFinal ? '🍔' : '🍕') : (isFinal ? '🍔' : String(i));
+          var s = make('div', cls, label);
+          if (isFinal && !filled) s.style.opacity = '0.75';
+          stamps.appendChild(s);
+        }
+      }
+
+      var bar = $('progressBar'), wrap = $('progressWrap'), txt = $('progressText');
+      if (bar) bar.style.width = Math.round((pts / STAMPS_NEEDED) * 100) + '%';
+      if (wrap) wrap.setAttribute('aria-valuenow', String(pts));
+      if (txt) {
+        if (pts >= STAMPS_NEEDED) txt.textContent = 'Card complete! Your free burger is ready to claim.';
+        else if (pts === 0) txt.textContent = STAMPS_NEEDED + ' stamps to go for a free burger.';
+        else txt.textContent = pts + ' of ' + STAMPS_NEEDED + ' collected — ' + (STAMPS_NEEDED - pts) + ' more for a free burger.';
+      }
+      var claimRow = $('claimRow');
+      if (claimRow) claimRow.classList.toggle('hidden', pts < STAMPS_NEEDED);
+    }
+
+    var bannerTimer = null;
+    function renderBanners() {
+      var section = $('bannerSection'), slider = $('bannerSlider');
+      if (!section || !slider) return;
+      if (bannerTimer) { clearInterval(bannerTimer); bannerTimer = null; }
+      var banners = getBanners();
+      clear(slider);
+      if (!banners.length) { section.classList.add('hidden'); return; }
+      section.classList.remove('hidden');
+
+      var slides = [];
+      var dotsWrap = make('div', 'banner-dots');
+      var dots = [];
+
+      banners.forEach(function (b, idx) {
+        var slide = make('div', 'banner-slide' + (idx === 0 ? ' active' : ''));
+        var img = safeImage(b.image);
+        if (img) slide.style.backgroundImage = 'url("' + img + '")';
+        if (b.title || b.subtitle) {
+          var text = make('div', 'banner-text');
+          if (b.title) text.appendChild(make('h3', '', b.title));
+          if (b.subtitle) text.appendChild(make('p', '', b.subtitle));
+          slide.appendChild(text);
+        }
+        slider.appendChild(slide);
+        slides.push(slide);
+
+        var dot = make('button', idx === 0 ? 'active' : '');
+        dot.type = 'button';
+        dot.setAttribute('aria-label', 'Show banner ' + (idx + 1));
+        dot.addEventListener('click', function () { show(idx); restart(); });
+        dotsWrap.appendChild(dot);
+        dots.push(dot);
+      });
+      if (banners.length > 1) slider.appendChild(dotsWrap);
+
+      var current = 0;
+      function show(i) {
+        current = i;
+        slides.forEach(function (s, k) { s.classList.toggle('active', k === i); });
+        dots.forEach(function (d, k) { d.classList.toggle('active', k === i); });
+      }
+      function restart() {
+        if (bannerTimer) clearInterval(bannerTimer);
+        if (slides.length > 1) {
+          bannerTimer = setInterval(function () { show((current + 1) % slides.length); }, 4500);
+        }
+      }
+      restart();
+    }
+
+    function renderDeals() {
+      var grid = $('dealsGrid');
+      if (!grid) return;
+      clear(grid);
+      var deals = getDeals();
+      if (!deals.length) {
+        var waiting = !cloudLoadedOnce && readJSON(KEYS.deals, null) === null;
+        grid.appendChild(make('div', 'glass empty', waiting ? 'Loading deals…' : 'No deals right now. Check back soon!'));
+        return;
+      }
+      deals.forEach(function (d) {
+        var card = make('article', 'glass deal');
+        var media = make('div', 'deal-media');
+        var img = safeImage(d.image);
+        if (img) media.style.backgroundImage = 'url("' + img + '")';
+        else media.textContent = d.icon || '🍕';
+        card.appendChild(media);
+
+        var body = make('div', 'deal-body');
+        body.appendChild(make('h3', '', d.title || 'Special deal'));
+        if (d.description) body.appendChild(make('p', '', d.description));
+        if (d.price) body.appendChild(make('div', 'deal-price', d.price));
+
+        var order = make('a', 'btn btn-wa btn-block', '💬 Order on WhatsApp');
+        var msg = 'Assalam o Alaikum Pizza Hub! I would like to order: ' + (d.title || 'a deal') + (d.price ? ' (' + d.price + ')' : '');
+        order.href = whatsappLink(msg);
+        order.target = '_blank';
+        order.rel = 'noopener noreferrer';
+        order.addEventListener('click', function () { logOrder(d.title, d.price); });
+        body.appendChild(order);
+
+        card.appendChild(body);
+        grid.appendChild(card);
+      });
+    }
+
+    function renderReviews() {
+      var track = $('reviewTrack');
+      if (!track || track.childNodes.length) return;
+      for (var round = 0; round < 2; round++) {
+        REVIEWS.forEach(function (r) {
+          var card = make('figure', 'glass review');
+          card.style.margin = '0';
+          if (round === 1) card.setAttribute('aria-hidden', 'true');
+          card.appendChild(make('div', 'stars', '★★★★★'));
+          card.appendChild(make('p', '', '“' + r.text + '”'));
+          var who = make('div', 'who');
+          who.appendChild(make('div', 'avatar', r.name.charAt(0)));
+          var nm = make('div', '', r.name);
+          nm.appendChild(make('small', '', r.city));
+          who.appendChild(nm);
+          card.appendChild(who);
+          track.appendChild(card);
+        });
+      }
+    }
+
+    function renderFooter() {
+      var s = getSettings();
+      var f = s.footer;
+
+      var desc = $('footDesc');
+      if (desc) desc.textContent = f.description;
+
+      var staff = $('footStaff');
+      if (staff) {
+        clear(staff);
+        String(f.staff || '').split(/\r?\n/).forEach(function (line) {
+          line = line.trim();
+          if (line) staff.appendChild(make('li', '', line));
+        });
+      }
+
+      var contact = $('footContact');
+      if (contact) {
+        clear(contact);
+        if (f.phone) {
+          var li1 = make('li'); li1.appendChild(make('span', '', '📞'));
+          var a1 = make('a', '', f.phone); a1.href = 'tel:' + String(f.phone).replace(/[^\d+]/g, '');
+          li1.appendChild(a1); contact.appendChild(li1);
+        }
+        if (f.email) {
+          var li2 = make('li'); li2.appendChild(make('span', '', '✉️'));
+          var a2 = make('a', '', f.email); a2.href = 'mailto:' + f.email;
+          li2.appendChild(a2); contact.appendChild(li2);
+        }
+        if (f.address) {
+          var li3 = make('li'); li3.appendChild(make('span', '', '📍'));
+          li3.appendChild(make('span', '', f.address));
+          contact.appendChild(li3);
+        }
+      }
+
+      var t = $('socTikTok'), fb = $('socFacebook'), ig = $('socInstagram');
+      if (t) t.href = safeUrl(s.social.tiktok);
+      if (fb) fb.href = safeUrl(s.social.facebook);
+      if (ig) ig.href = safeUrl(s.social.instagram);
+    }
+
+    function renderProfile() {
+      var u = currentUser();
+      if ($('pfName')) $('pfName').textContent = u ? u.name : '—';
+      if ($('pfMobile')) $('pfMobile').textContent = u ? u.mobile : '—';
+      if ($('pfPoints')) $('pfPoints').textContent = u ? ((Number(u.points) || 0) + ' / ' + STAMPS_NEEDED) : '—';
+      if ($('pfRedeemed')) $('pfRedeemed').textContent = u ? String(Number(u.redemptions) || 0) : '—';
+    }
+
+    function renderAll() {
+      if (!currentUser()) {
+        if (getSession()) setSession('');
+        openModal('loginModal');
+      }
+      renderCard();
+      renderBanners();
+      renderDeals();
+      renderFooter();
+      renderProfile();
+    }
+
+    /* ---------- Confetti ---------- */
+    function confetti() {
+      var layer = make('div', 'confetti-layer');
+      var colors = ['#ffd700', '#ffaa00', '#ffffff', '#e5142b', '#fff2a8'];
+      for (var i = 0; i < 60; i++) {
+        var p = make('i', 'confetti-piece');
+        p.style.left = Math.random() * 100 + '%';
+        p.style.background = colors[i % colors.length];
+        p.style.animationDuration = (2.2 + Math.random() * 2.2) + 's';
+        p.style.animationDelay = (Math.random() * 0.8) + 's';
+        p.style.setProperty('--dx', (Math.random() * 160 - 80) + 'px');
+        p.style.borderRadius = i % 3 === 0 ? '50%' : '2px';
+        layer.appendChild(p);
+      }
+      document.body.appendChild(layer);
+      setTimeout(function () { if (layer.parentNode) layer.parentNode.removeChild(layer); }, 5500);
+    }
+    function showCelebration() {
+      openModal('rewardModal');
+      confetti();
+    }
+
+    /* ---------- Actions ---------- */
+    function addPoint() {
+      var m = getSession();
+      var users = getUsers();
+      var me = m ? users[m] : null;
+      if (!me) { toast('Please log in first.', 'error'); return; }
+      var pts = Number(me.points) || 0;
+      if (pts >= STAMPS_NEEDED) { toast('Card is full. Claim the free burger first!', 'error'); return; }
+      me.points = pts + 1;
+      users[m] = me;
+      if (!writeJSON(KEYS.users, users)) { toast('Could not save. Browser storage is full or blocked.', 'error'); return; }
+      renderCard();
+      renderProfile();
+      pushUser(m);
+      if (me.points >= STAMPS_NEEDED) {
+        setTimeout(showCelebration, 700);
+      } else {
+        toast('Stamp added! ' + me.points + ' / ' + STAMPS_NEEDED, 'ok');
+      }
+    }
+
+    function claimReward() {
+      var m = getSession();
+      var users = getUsers();
+      var me = m ? users[m] : null;
+      if (!me || (Number(me.points) || 0) < STAMPS_NEEDED) { closeModal('rewardModal'); return; }
+      me.points = 0;
+      me.redemptions = (Number(me.redemptions) || 0) + 1;
+      users[m] = me;
+      var stats = getStats();
+      stats.redemptions += 1;
+      if (!writeJSON(KEYS.users, users) || !writeJSON(KEYS.stats, stats)) {
+        toast('Could not save. Browser storage is full or blocked.', 'error');
+        return;
+      }
+      closeModal('rewardModal');
+      renderCard();
+      renderProfile();
+      pushUser(m);
+      toast('Reward claimed! Your card is reset. 🍔', 'ok');
+    }
+
+    function scrollToDeals() {
+      var sec = $('deals');
+      if (!sec) return;
+      sec.scrollIntoView({ behavior: 'smooth', block: 'start' });
+      var grid = $('dealsGrid');
+      if (grid) {
+        grid.classList.remove('deals-flash');
+        void grid.offsetWidth;
+        grid.classList.add('deals-flash');
+      }
+    }
+
+    function orderOnWhatsApp() {
+      logOrder('Order from the menu', '');
+      var u = currentUser();
+      var text = 'Assalam o Alaikum Pizza Hub! I would like to place an order.' + (u ? ' (' + u.name + ', ' + u.mobile + ')' : '');
+      openLink(whatsappLink(text));
+    }
+
+    function openLink(url) {
+      var w = null;
+      try { w = window.open(url, '_blank'); } catch (e) { w = null; }
+      if (w) { try { w.opener = null; } catch (e2) { /* ignore */ } }
+      else { window.location.href = url; }
+    }
+
+    function logout() {
+      stopWatchingOwn();
+      setSession('');
+      closeModal('profileModal');
+      var n = $('loginName'), mo = $('loginMobile');
+      if (n) n.value = '';
+      if (mo) mo.value = '';
+      renderAll();
+    }
+
+    /* ---------- Cloud sync (Firebase Realtime Database, live updates) ---------- */
+    var cloudLoadedOnce = false;
+
+    /* Remove leftovers from older cloud settings (other services, URLs, keys) */
+    function purgeOldCloudSettings() {
+      try { window.localStorage.removeItem(KEYS.cloud); } catch (e) { /* ignore */ }
+    }
+    /* True when the admin panel on this same device still has changes waiting to upload */
+    function hasUnsentAdminChanges() {
+      try { return window.localStorage.getItem('ph_cloud_dirty') === '1'; } catch (e) { return false; }
+    }
+
+    function strOf(v, max) { return typeof v === 'string' ? v.slice(0, max) : ''; }
+    function uid(prefix) { return prefix + Date.now().toString(36) + Math.random().toString(36).slice(2, 6); }
+    function sanitizeDeal(d) {
+      if (!d || typeof d !== 'object') return null;
+      var title = strOf(d.title, 80).trim();
+      if (!title) return null;
+      return {
+        id: strOf(d.id, 40) || uid('d'),
+        title: title,
+        description: strOf(d.description, 260),
+        price: strOf(d.price, 40),
+        icon: strOf(d.icon, 8) || '🍕',
+        image: safeImage(d.image)
+      };
+    }
+    function sanitizeBanner(b) {
+      if (!b || typeof b !== 'object') return null;
+      var out = {
+        id: strOf(b.id, 40) || uid('b'),
+        title: strOf(b.title, 90),
+        subtitle: strOf(b.subtitle, 140),
+        image: safeImage(b.image)
+      };
+      return (out.title || out.subtitle || out.image) ? out : null;
+    }
+    /* Firebase stores lists as objects and drops empty ones, so always turn the value back into a list */
+    function toList(v) {
+      if (Array.isArray(v)) return v.filter(function (x) { return x && typeof x === 'object'; });
+      if (v && typeof v === 'object') {
+        return Object.keys(v).sort(function (a, b) { return Number(a) - Number(b); })
+          .map(function (k) { return v[k]; })
+          .filter(function (x) { return x && typeof x === 'object'; });
+      }
+      return [];
+    }
+
+    /* Copies live cloud data into this phone's cache; returns true when something visible changed */
+    function applyCloudRecord(rec) {
+      var changed = false;
+      var deals = toList(rec && rec.deals).slice(0, 50).map(sanitizeDeal).filter(Boolean);
+      var banners = toList(rec && rec.banners).slice(0, 50).map(sanitizeBanner).filter(Boolean);
+      if (JSON.stringify(deals) !== JSON.stringify(readJSON(KEYS.deals, null))) {
+        if (writeJSON(KEYS.deals, deals)) { changed = true; renderDeals(); }
+      }
+      if (JSON.stringify(banners) !== JSON.stringify(readJSON(KEYS.banners, null))) {
+        if (writeJSON(KEYS.banners, banners)) { changed = true; renderBanners(); }
+      }
+      return changed;
+    }
+
+    /* Starts listening. Firebase pushes every change instantly and reconnects by itself after being offline.
+       If it cannot load, the page simply keeps using the data saved on this phone. */
+    function cloudStart() {
+      var b = window.PizzaHubCloud;
+      if (!b) { cloudLoadedOnce = true; renderDeals(); return; }
+      function finishLoading() {
+        if (cloudLoadedOnce) return;
+        cloudLoadedOnce = true;
+        renderDeals();
+      }
+      b.onData(function (rec) {
+        var first = !cloudLoadedOnce;
+        cloudLoadedOnce = true;
+        /* an empty cloud (null) never wipes what is saved on this phone */
+        var changed = (rec === null || rec === undefined || hasUnsentAdminChanges()) ? false : applyCloudRecord(rec);
+        if (first && !changed) renderDeals();
+      });
+      b.onStatus(function (state) {
+        if (state === 'error') finishLoading();
+        if (state === 'online') { flushDirtyUsers(); flushOrders(); }
+      });
+      b.onReady(function () { startOwnWatch(); flushDirtyUsers(); flushOrders(); });
+      window.addEventListener('online', function () { flushDirtyUsers(); flushOrders(); });
+      setTimeout(finishLoading, 8000);
+    }
+
+    /* ---------- Customer accounts (saved in Firebase, so a card follows the customer to any phone) ---------- */
+    var USER_DIRTY_KEY = 'ph_users_dirty';
+    var ownUnsub = null;
+    var watchedMobile = '';
+
+    /* only these fields are stored in the cloud */
+    function publicUser(u) {
+      return {
+        name: strOf(u && u.name, 40),
+        mobile: strOf(u && u.mobile, 15),
+        points: Math.max(0, Math.min(STAMPS_NEEDED, Number(u && u.points) || 0)),
+        redemptions: Math.max(0, Number(u && u.redemptions) || 0),
+        createdAt: strOf(u && u.createdAt, 40)
+      };
+    }
+    function getDirtyUsers() {
+      var l = readJSON(USER_DIRTY_KEY, []);
+      return Array.isArray(l) ? l : [];
+    }
+    function setUserDirty(mobile, on) {
+      var l = getDirtyUsers().filter(function (m) { return m !== mobile; });
+      if (on) l.push(mobile);
+      writeJSON(USER_DIRTY_KEY, l);
+    }
+    function isUserDirty(mobile) { return getDirtyUsers().indexOf(mobile) !== -1; }
+    function markSynced(mobile) {
+      var users = getUsers();
+      if (users[mobile] && users[mobile].cloudSynced !== true) {
+        users[mobile].cloudSynced = true;
+        writeJSON(KEYS.users, users);
+      }
+    }
+    function cloudBridge() {
+      var b = window.PizzaHubCloud;
+      return (b && b.isReady()) ? b : null;
+    }
+    function withTimeout(promise, ms) {
+      return Promise.race([promise, new Promise(function (resolve, reject) {
+        setTimeout(function () { reject(new Error('timeout')); }, ms);
+      })]);
+    }
+    function adoptCloudUser(mobile, cu) {
+      var users = getUsers();
+      var rec = publicUser(cu);
+      rec.mobile = mobile;
+      users[mobile] = Object.assign({}, rec, { cloudSynced: true });
+      writeJSON(KEYS.users, users);
+    }
+
+    /* Uploads this phone's copy of the account. If it cannot be sent now it stays queued and is retried. */
+    function pushUser(mobile) {
+      var u = getUsers()[mobile];
+      if (!u) return Promise.resolve(false);
+      setUserDirty(mobile, true);
+      var b = cloudBridge();
+      if (!b) return Promise.resolve(false);
+      var p;
+      try { p = b.saveUser(mobile, publicUser(u)); } catch (e) { return Promise.resolve(false); }
+      p.then(function () { setUserDirty(mobile, false); markSynced(mobile); }, function () { /* stays queued */ });
+      return withTimeout(p.then(function () { return true; }, function () { return false; }), 8000).catch(function () { return false; });
+    }
+
+    /* Sends everything that is waiting. A card that was never matched with the cloud first checks the cloud copy. */
+    function flushDirtyUsers() {
+      var b = cloudBridge();
+      if (!b) return;
+      getDirtyUsers().forEach(function (mobile) {
+        var u = getUsers()[mobile];
+        if (!u) { setUserDirty(mobile, false); return; }
+        if (u.cloudSynced === true) { pushUser(mobile); return; }
+        withTimeout(b.getUser(mobile), 8000).then(function (cu) {
+          if (cu && typeof cu === 'object') {
+            adoptCloudUser(mobile, cu);
+            setUserDirty(mobile, false);
+            if (getSession() === mobile) { renderCard(); renderProfile(); }
+          } else {
+            pushUser(mobile);
+          }
+        }).catch(function () { /* stays queued */ });
+      });
+    }
+
+    /* Live updates for this customer's own card (for example when the shop resets or removes it) */
+    function onOwnCloudUser(mobile, cu) {
+      if (getSession() !== mobile) return;
+      var users = getUsers();
+      var me = users[mobile];
+      if (isUserDirty(mobile)) return; /* changes made on this phone that are still uploading win */
+      if (cu === null || cu === undefined) {
+        if (me && me.cloudSynced === true) {
+          /* the shop deleted this account */
+          delete users[mobile];
+          writeJSON(KEYS.users, users);
+          setUserDirty(mobile, false);
+          setSession('');
+          stopWatchingOwn();
+          toast('Your account was removed by the shop.', 'error');
+          renderAll();
+        } else if (me) {
+          pushUser(mobile);
+        }
+        return;
+      }
+      var clean = publicUser(cu);
+      clean.mobile = mobile;
+      if (!me || me.cloudSynced !== true || JSON.stringify(publicUser(me)) !== JSON.stringify(clean)) {
+        users[mobile] = Object.assign({}, clean, { cloudSynced: true });
+        writeJSON(KEYS.users, users);
+        renderCard();
+        renderProfile();
+      }
+    }
+    function startOwnWatch() {
+      var mobile = getSession();
+      var b = cloudBridge();
+      if (!b || !mobile || watchedMobile === mobile) return;
+      stopWatchingOwn();
+      watchedMobile = mobile;
+      ownUnsub = b.watchUser(mobile, function (cu) { onOwnCloudUser(mobile, cu); }, function () { /* offline or blocked: keep using this phone's copy */ });
+    }
+    function stopWatchingOwn() {
+      if (typeof ownUnsub === 'function') { try { ownUnsub(); } catch (e) { /* ignore */ } }
+      ownUnsub = null;
+      watchedMobile = '';
+    }
+
+    /* ---------- Order requests (logged in Firebase so the shop sees them instantly) ---------- */
+    var ORDER_QUEUE_KEY = 'ph_orders_queue';
+    function getOrderQueue() {
+      var q = readJSON(ORDER_QUEUE_KEY, []);
+      return Array.isArray(q) ? q : [];
+    }
+    function saveOrderQueue(q) { writeJSON(ORDER_QUEUE_KEY, q.slice(-30)); }
+    function sendOrder(order) {
+      var b = cloudBridge();
+      if (!b) return Promise.resolve(false);
+      var p;
+      try { p = b.addOrder(order); } catch (e) { return Promise.resolve(false); }
+      p.then(function () {
+        saveOrderQueue(getOrderQueue().filter(function (o) { return o.id !== order.id; }));
+      }, function () {
+        /* keep it queued and retry a few times, then give up so a blocked order cannot repeat forever */
+        var q = getOrderQueue();
+        q.forEach(function (o) { if (o.id === order.id) o.tries = (o.tries || 0) + 1; });
+        saveOrderQueue(q.filter(function (o) { return (o.tries || 0) < 5; }));
+      });
+      return withTimeout(p.then(function () { return true; }, function () { return false; }), 8000).catch(function () { return false; });
+    }
+    function logOrder(item, price) {
+      var u = currentUser();
+      var order = {
+        id: uid('o'),
+        name: u ? strOf(u.name, 40) : 'Guest',
+        mobile: u ? strOf(u.mobile, 15) : '',
+        item: strOf(item, 80) || 'Order',
+        price: strOf(price, 40),
+        createdAt: new Date().toISOString()
+      };
+      var q = getOrderQueue();
+      q.push(order);
+      saveOrderQueue(q);
+      sendOrder(order);
+    }
+    function flushOrders() { getOrderQueue().forEach(sendOrder); }
+
+    /* ---------- Wire up ---------- */
+    function init() {
+      purgeOldCloudSettings();
+      var yr = $('year'); if (yr) yr.textContent = String(new Date().getFullYear());
+      renderReviews();
+
+      /* Menu */
+      var menuBtn = $('menuBtn');
+      if (menuBtn) {
+        menuBtn.addEventListener('click', function (e) {
+          e.stopPropagation();
+          var drop = $('menuDrop');
+          setMenu(drop ? drop.classList.contains('hidden') : false);
+        });
+      }
+      document.addEventListener('click', function (e) {
+        var wrap = document.querySelector('.menu-wrap');
+        if (wrap && !wrap.contains(e.target)) setMenu(false);
+      });
+      document.addEventListener('keydown', function (e) {
+        if (e.key === 'Escape') { setMenu(false); closeAllDismissible(); }
+      });
+
+      var mp = $('menuProfile'), md = $('menuDeals'), mw = $('menuWhatsApp'), ma = $('menuAdmin');
+      if (mp) mp.addEventListener('click', function () { setMenu(false); renderProfile(); openModal('profileModal'); });
+      if (md) md.addEventListener('click', function () { setMenu(false); scrollToDeals(); });
+      if (mw) mw.addEventListener('click', function () { setMenu(false); orderOnWhatsApp(); });
+      if (ma) ma.addEventListener('click', function () {
+        setMenu(false);
+        var gi = $('gateInput'), ge = $('gateError');
+        if (gi) gi.value = '';
+        if (ge) ge.textContent = '';
+        openModal('adminGateModal');
+      });
+
+      /* Generic close buttons + backdrop click */
+      var closers = document.querySelectorAll('[data-close]');
+      for (var i = 0; i < closers.length; i++) {
+        closers[i].addEventListener('click', function (e) {
+          closeModal(e.currentTarget.getAttribute('data-close'));
+        });
+      }
+      var backdrops = document.querySelectorAll('.modal-backdrop');
+      for (var j = 0; j < backdrops.length; j++) {
+        backdrops[j].addEventListener('mousedown', function (e) {
+          if (e.target === e.currentTarget && e.currentTarget.getAttribute('data-locked') !== 'true') {
+            e.currentTarget.classList.add('hidden');
+          }
+        });
+      }
+
+      /* Login */
+      var loginForm = $('loginForm');
+      if (loginForm) {
+        loginForm.addEventListener('submit', function (e) {
+          e.preventDefault();
+          var err = $('loginError');
+          var name = ($('loginName') ? $('loginName').value : '').replace(/\s+/g, ' ').trim();
+          var mobile = normalizeMobile($('loginMobile') ? $('loginMobile').value : '');
+          if (err) err.textContent = '';
+
+          if (name.length < 2) { if (err) err.textContent = 'Please enter your name (at least 2 letters).'; return; }
+          if (!mobile) { if (err) err.textContent = 'Enter a valid mobile number like 0300 1234567.'; return; }
+
+          var submitBtn = loginForm.querySelector('button[type="submit"]');
+          var label = submitBtn ? submitBtn.textContent : '';
+
+          /* works without internet: uses (or creates) the account saved on this phone */
+          function localLogin() {
+            var users = getUsers();
+            var existing = users[mobile];
+            if (existing && typeof existing === 'object') {
+              setSession(mobile);
+              if (existing.cloudSynced !== true) setUserDirty(mobile, true);
+              toast('Welcome back, ' + existing.name + '! Your card is loaded.', 'ok');
+            } else {
+              users[mobile] = { name: name, mobile: mobile, points: 0, redemptions: 0, createdAt: new Date().toISOString() };
+              if (!writeJSON(KEYS.users, users)) {
+                if (err) err.textContent = 'Could not save your account. Please allow browser storage and try again.';
+                return false;
+              }
+              setSession(mobile);
+              setUserDirty(mobile, true);
+              toast('Welcome to Pizza Hub, ' + name + '! 🍕', 'ok');
+            }
+            return true;
+          }
+          function finish(ok) {
+            if (submitBtn) { submitBtn.disabled = false; submitBtn.textContent = label; }
+            if (!ok) return;
+            closeModal('loginModal');
+            renderAll();
+            startOwnWatch();
+            flushDirtyUsers();
+          }
+
+          var b = cloudBridge();
+          if (!b) { finish(localLogin()); return; }
+          if (submitBtn) { submitBtn.disabled = true; submitBtn.textContent = 'Checking your account…'; }
+          withTimeout(b.getUser(mobile), 6000).then(function (cu) {
+            if (cu && typeof cu === 'object') {
+              /* existing card from any device: load it instead of creating a new one */
+              var rec = publicUser(cu);
+              rec.mobile = mobile;
+              var users = getUsers();
+              users[mobile] = Object.assign({}, rec, { cloudSynced: true });
+              if (!writeJSON(KEYS.users, users)) throw new Error('storage');
+              setUserDirty(mobile, false);
+              setSession(mobile);
+              toast('Welcome back, ' + rec.name + '! Your card is loaded.', 'ok');
+              return true;
+            }
+            var ok = localLogin();
+            if (ok) pushUser(mobile);
+            return ok;
+          }).catch(function () { return localLogin(); }).then(finish);
+        });
+      }
+
+      /* Profile logout */
+      var lo = $('logoutBtn');
+      if (lo) lo.addEventListener('click', logout);
+
+      /* Admin gate */
+      var gateForm = $('gateForm');
+      if (gateForm) {
+        gateForm.addEventListener('submit', function (e) {
+          e.preventDefault();
+          var val = $('gateInput') ? $('gateInput').value : '';
+          if (val === getSettings().adminPassword) {
+            try { window.sessionStorage.setItem('ph_admin_ok', '1'); } catch (er) { /* ignore */ }
+            window.location.href = 'admin.html';
+          } else {
+            var ge = $('gateError');
+            if (ge) ge.textContent = 'Wrong password. Please try again.';
+            var gi = $('gateInput');
+            if (gi) { gi.value = ''; gi.classList.remove('shake'); void gi.offsetWidth; gi.classList.add('shake'); }
+          }
+        });
+      }
+
+      /* Staff stamp entry: instant on exact match, or via button/Enter */
+      var unlockInput = $('unlockInput');
+      var unlockForm = $('unlockForm');
+      if (unlockInput) {
+        unlockInput.addEventListener('input', function () {
+          if (unlockInput.value && unlockInput.value === getSettings().adminPassword) {
+            unlockInput.value = '';
+            addPoint();
+          }
+        });
+      }
+      if (unlockForm) {
+        unlockForm.addEventListener('submit', function (e) {
+          e.preventDefault();
+          if (!unlockInput) return;
+          var val = unlockInput.value;
+          if (!val) { toast('Enter the secret password first.', 'error'); return; }
+          if (val === getSettings().adminPassword) {
+            unlockInput.value = '';
+            addPoint();
+          } else {
+            toast('Wrong password.', 'error');
+            unlockInput.value = '';
+            unlockInput.classList.remove('shake'); void unlockInput.offsetWidth; unlockInput.classList.add('shake');
+          }
+        });
+      }
+
+      /* Reward + deals + help */
+      var cb = $('claimBtn'); if (cb) cb.addEventListener('click', showCelebration);
+      var rc = $('rewardClaimBtn'); if (rc) rc.addEventListener('click', claimReward);
+      var eb = $('exploreBtn'); if (eb) eb.addEventListener('click', scrollToDeals);
+      var hl = $('helpLink');
+      if (hl) hl.addEventListener('click', function () {
+        openLink(whatsappLink('Assalam o Alaikum Pizza Hub! I need some help.'));
+      });
+
+      /* Real-time sync with admin.html (other tab/window, same browser) */
+      window.addEventListener('storage', function (e) {
+        if (!e.key || e.key.indexOf('ph_') === 0) renderAll();
+      });
+
+      renderAll();
+      cloudStart();
+    }
+
+    if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init);
+    else init();
+  })();
+  </script>
+</body>
+</html>
